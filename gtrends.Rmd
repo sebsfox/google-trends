@@ -1,0 +1,196 @@
+---
+title: "Google trends vs obesity"
+author: "Seb Fox"
+date: "11 October 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Purpose
+
+
+## Background
+
+
+## Get trends data
+
+```{r get trends, message=FALSE}
+
+pkgs <- c("gtrendsR")
+if (length(setdiff(pkgs, rownames(installed.packages()))) > 0) {
+    devtools::install_github("PMassicotte/gtrendsR")
+}
+library(gtrendsR)
+searches <- gtrends(c("lose weight","diet"), geo = "GB", time = "2013-01-01 2015-12-31")
+
+```
+
+### Geolocate cities
+
+```{r geolocate, message=FALSE, warning=FALSE, cache=TRUE}
+library(ggmap)
+cities <- paste(unique(searches$interest_by_city$location), "UK", sep = ", ")
+cities <- data.frame(cities = cities, geocode(cities))
+
+na_cities <- as.character(cities[is.na(cities$lon),]$cities)
+nas <- length(na_cities)
+new_cities <- data.frame()
+while(nas > 0) {
+    new_cities <- rbind(data.frame(cities = na_cities, geocode(na_cities)),
+                        new_cities)
+    na_cities <- as.character(new_cities[is.na(new_cities$lon),]$cities)
+    nas <- length(na_cities)
+    new_cities <- new_cities[!is.na(new_cities$lon),]
+}
+cities <- cities[!is.na(cities$lon),]
+
+cities <- rbind(cities, new_cities)
+```
+
+
+### Plot cities
+
+```{r plot england cities, message=FALSE}
+library(geojsonio)
+library(ggplot2)
+library(broom)
+eng.sp <- geojson_read("https://opendata.arcgis.com/datasets/37bcb9c9e788497ea4f80543fd14c0a7_4.geojson",
+                    what = "sp")
+eng <- tidy(eng.sp, region = "ctry16cd")
+
+ggplot(eng, aes(x = long, y = lat)) +
+    geom_polygon(aes(group = group),
+                 fill = NA,
+                 col = "black") +
+    geom_point(data = cities, aes(x = lon, y = lat)) +
+    theme_void() + 
+    coord_map()
+
+```
+
+## Voronoi polygons
+
+```{r voronoi, message=FALSE, fig.height=12}
+# taken from https://stackoverflow.com/questions/24236698/voronoi-diagram-polygons-enclosed-in-geographic-borders
+voronoipolygons <- function(x, poly) {
+    library(deldir)
+    library(rgdal)
+    if (.hasSlot(x, 'coords')) {
+        crds <- x@coords  
+    } else crds <- x
+    bb = bbox(poly)
+    rw = as.numeric(t(bbox(poly)))
+    z <- deldir(crds[,1], crds[,2],rw=rw)
+    w <- tile.list(z)
+    polys <- vector(mode='list', length=length(w))
+    library(sp)
+    for (i in seq(along=polys)) {
+        pcrds <- cbind(w[[i]]$x, w[[i]]$y)
+        pcrds <- rbind(pcrds, pcrds[1,])
+        polys[[i]] <- Polygons(list(Polygon(pcrds)), ID=as.character(i))
+    }
+    SP <- SpatialPolygons(polys)
+    SpatialPolygonsDataFrame(
+        SP, data.frame(x=crds[,1], y=crds[,2], 
+                       row.names=sapply(slot(SP, 'polygons'), 
+                                        function(x) slot(x, 'ID'))))  
+}
+
+v.sp <- voronoipolygons(cities[,c("lon","lat")], eng.sp)
+v.sp@data <- cbind(v.sp@data, cities = cities$cities)
+v <- tidy(v.sp, region = "cities")
+
+p <- ggplot(eng, aes(x = long, y = lat)) +
+    geom_polygon(aes(group = group),
+                 fill = NA,
+                 col = "black") +
+    geom_polygon(data = v, aes(x = long, y = lat, group = group),
+                 col = "darkred", fill = NA) +
+    geom_point(data = cities, aes(x = lon, y = lat)) +
+    coord_map() + 
+    theme_void()
+print(p)
+```
+
+
+## Add local authorities and work out percentage of each new polygon in each LA
+
+```{r local authorities, message=FALSE}
+la.sp <- geojson_read("https://opendata.arcgis.com/datasets/687f346f5023410ba86615655ff33ca9_3.geojson",
+                    what = "sp")
+
+v.sp@proj4string <- la.sp@proj4string
+
+# the following is taken from https://gis.stackexchange.com/questions/140504/extracting-intersection-areas-in-r
+library(raster)
+proportioned_areas <- intersect(la.sp, v.sp)
+plot(la.sp, axes=T); plot(v.sp, add=T); plot(proportioned_areas, add=T, col='red')
+
+# Extract areas from polygon objects then attach as attribute
+# areas <- data.frame(area=sapply(proportioned_areas@polygons, FUN=function(x) {slot(x, 'area')}))
+# row.names(areas) <- sapply(proportioned_areas@polygons, FUN=function(x) {slot(x, 'ID')})
+
+# Combine attributes info and areas 
+library(maptools)
+#attArea <- spCbind(proportioned_areas, areas)
+attArea <- spCbind(proportioned_areas, area(proportioned_areas))
+
+library(dplyr)
+proportioned_areas_df <- select(attArea@data, ctyua16cd, ctyua16nm, st_areashape, cities, area.proportioned_areas.) %>%
+    #group_by(ctyua16cd, ctyua16nm,  st_areashape) %>%
+    group_by(cities) %>%
+    mutate(proportioned_area = area.proportioned_areas./sum(area.proportioned_areas.)) %>%
+    ungroup() %>%
+    select(-area.proportioned_areas.)
+
+```
+
+### Add hits for each city
+
+```{r sum hits per city, message=FALSE}
+hits <- searches$interest_by_city[,c("location","keyword","hits")] %>%
+        group_by(location, keyword) %>%
+        summarise(keywordmean = mean(hits)) %>%
+        group_by(location) %>%
+        summarise(hits = mean(keywordmean)) %>%
+        mutate(location = paste(location, "UK", sep = ", "))
+df <- merge(proportioned_areas_df, hits, by.x = "cities", by.y = "location", all.x=TRUE) %>%
+    mutate(obesity_google = hits * proportioned_area) %>%
+    group_by(ctyua16cd, ctyua16nm) %>%
+    summarise(obesity_google = mean(obesity_google)) %>%
+    filter(grepl("^E", ctyua16cd))
+
+### note, these are missing LAs for some reason - must come back to this
+unique(la.sp@data$ctyua16cd)[grepl("^E",unique(la.sp@data$ctyua16cd))][!unique(la.sp@data$ctyua16cd)[grepl("^E",unique(la.sp@data$ctyua16cd))] %in% unique(df$ctyua16cd)]
+
+```
+
+## Compare to Fingertips data
+
+```{r fingertips comparison, message=FALSE, warning=FALSE}
+library(fingertipsR)
+fingdata <- fingertips_data(90640) %>%
+    filter(TimeperiodSortable == max(TimeperiodSortable) &
+                                         AreaType == "County & UA") %>%
+    select(AreaCode, Value)
+
+dfgraph <- left_join(df, fingdata, by = c("ctyua16cd" = "AreaCode")) %>%
+        rename(fingertips = Value) %>%
+        mutate(label = paste0(ctyua16nm,"\nFingertips value: ",round(fingertips, 2),"\nGoogle trend relative number of hits: ", round(obesity_google,2)))
+dfgraph <- cbind(dfgraph, 
+                 fingertips_scaled = as.vector(scale(dfgraph$fingertips)),
+                 google_scaled = as.vector(scale(dfgraph$obesity_google)))
+
+p <- ggplot(dfgraph, aes(x = fingertips_scaled, y = google_scaled, label = label)) +
+        geom_point() +
+        labs(x = "2.12 - Percentage of adults classified as overweight or obese",
+             y = "Google trends searches for diet and lose weight") + 
+        geom_text(aes(x = min(dfgraph$fingertips_scaled) * 1.05, y = max(dfgraph$google_scaled) * 0.95,
+                      label = paste("R^2:", round(summary(lm(google_scaled ~ fingertips_scaled,
+                                                     data=dfgraph))$r.squared,2))))
+library(plotly)
+ggplotly(p, tooltip = c("label"))
+```
