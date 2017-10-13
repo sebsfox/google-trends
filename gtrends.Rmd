@@ -24,8 +24,10 @@ if (length(setdiff(pkgs, rownames(installed.packages()))) > 0) {
     devtools::install_github("PMassicotte/gtrendsR")
 }
 library(gtrendsR)
-searches <- gtrends(c("lose weight","diet"), geo = "GB", time = "2013-01-01 2015-12-31")
-
+searchterm <- c("diet")
+searches <- gtrends(searchterm, geo = "GB", time = "2013-01-01 2015-12-31")
+timeperiods <- c(2013, 2014, 2015)
+IndicatorID <- 90640
 ```
 
 ### Geolocate cities
@@ -139,19 +141,27 @@ library(maptools)
 attArea <- spCbind(proportioned_areas, area(proportioned_areas))
 
 library(dplyr)
-proportioned_areas_df <- select(attArea@data, ctyua16cd, ctyua16nm, st_areashape, cities, area.proportioned_areas.) %>%
+proportioned_areas_df <- dplyr::select(attArea@data,ctyua16cd, ctyua16nm, st_areashape, cities, area.proportioned_areas.) %>%
     #group_by(ctyua16cd, ctyua16nm,  st_areashape) %>%
     group_by(cities) %>%
     mutate(proportioned_area = area.proportioned_areas./sum(area.proportioned_areas.)) %>%
     ungroup() %>%
-    select(-area.proportioned_areas.)
+    dplyr::select(-area.proportioned_areas.)
 
 ```
 
-### Add hits for each city
+### Add hits for each city and divide by population
 
 ```{r sum hits per city, message=FALSE}
+library(fingertipsR)
+pops <- fingertips_data(1170) %>%
+        filter(AreaType == "County & UA" &
+                       Timeperiod %in% timeperiods) %>%
+        group_by(AreaCode) %>%
+        summarise(population = mean(Value))
+
 hits <- searches$interest_by_city[,c("location","keyword","hits")] %>%
+        mutate(hits = log(hits)) %>%
         group_by(location, keyword) %>%
         summarise(keywordmean = mean(hits)) %>%
         group_by(location) %>%
@@ -161,36 +171,40 @@ df <- merge(proportioned_areas_df, hits, by.x = "cities", by.y = "location", all
     mutate(obesity_google = hits * proportioned_area) %>%
     group_by(ctyua16cd, ctyua16nm) %>%
     summarise(obesity_google = mean(obesity_google)) %>%
-    filter(grepl("^E", ctyua16cd))
+    filter(grepl("^E", ctyua16cd)) %>%
+        left_join(pops, by = c("ctyua16cd" = "AreaCode")) %>%
+        mutate(obesity_google = obesity_google * 100000 / population) %>%
+        dplyr::select(-population)
 
 ### note, these are missing LAs for some reason - must come back to this
-unique(la.sp@data$ctyua16cd)[grepl("^E",unique(la.sp@data$ctyua16cd))][!unique(la.sp@data$ctyua16cd)[grepl("^E",unique(la.sp@data$ctyua16cd))] %in% unique(df$ctyua16cd)]
+# unique(la.sp@data$ctyua16cd)[grepl("^E",unique(la.sp@data$ctyua16cd))][!unique(la.sp@data$ctyua16cd)[grepl("^E",unique(la.sp@data$ctyua16cd))] %in% unique(df$ctyua16cd)]
 
 ```
 
 ## Compare to Fingertips data
 
 ```{r fingertips comparison, message=FALSE, warning=FALSE}
-library(fingertipsR)
-fingdata <- fingertips_data(90640) %>%
+
+fingdata <- fingertips_data(IndicatorID) %>%
     filter(TimeperiodSortable == max(TimeperiodSortable) &
                                          AreaType == "County & UA") %>%
-    select(AreaCode, Value)
+    dplyr::select(IndicatorName, AreaCode, Value)
 
 dfgraph <- left_join(df, fingdata, by = c("ctyua16cd" = "AreaCode")) %>%
         rename(fingertips = Value) %>%
         mutate(label = paste0(ctyua16nm,"\nFingertips value: ",round(fingertips, 2),"\nGoogle trend relative number of hits: ", round(obesity_google,2)))
-dfgraph <- cbind(dfgraph, 
-                 fingertips_scaled = as.vector(scale(dfgraph$fingertips)),
-                 google_scaled = as.vector(scale(dfgraph$obesity_google)))
+# dfgraph <- cbind(dfgraph, 
+#                  fingertips_scaled = as.vector(scale(dfgraph$fingertips)),
+#                  google_scaled = as.vector(scale(dfgraph$obesity_google)))
 
-p <- ggplot(dfgraph, aes(x = fingertips_scaled, y = google_scaled, label = label)) +
+p <- ggplot(dfgraph, aes(x = fingertips, y = obesity_google, label = label)) +
         geom_point() +
-        labs(x = "2.12 - Percentage of adults classified as overweight or obese",
-             y = "Google trends searches for diet and lose weight") + 
-        geom_text(aes(x = min(dfgraph$fingertips_scaled) * 1.05, y = max(dfgraph$google_scaled) * 0.95,
-                      label = paste("R^2:", round(summary(lm(google_scaled ~ fingertips_scaled,
-                                                     data=dfgraph))$r.squared,2))))
+        labs(x = as.character(unique(fingdata$IndicatorName)),
+             y = paste("Google trends searches for",paste(searchterm, collapse = " and ")),
+             title = paste("R^2:", round(summary(lm(obesity_google ~ fingertips,
+                                                     data=dfgraph))$r.squared,2))) +
+        theme(axis.text = element_blank(),
+              axis.ticks = element_blank())
 library(plotly)
 ggplotly(p, tooltip = c("label"))
 ```
